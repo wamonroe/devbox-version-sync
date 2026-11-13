@@ -1,0 +1,12 @@
+name: Devbox Version Sync
+description: Puts the devbox-version-sync command on the PATH. The reusable workflows in this repository use it.
+author: wamonroe
+branding:
+  icon: refresh-cw
+  color: blue
+runs:
+  using: composite
+  steps:
+    - name: Add devbox-version-sync to the PATH
+      shell: bash
+      run: echo "$GITHUB_ACTION_PATH/bin" >> "$GITHUB_PATH"

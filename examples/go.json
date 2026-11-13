@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/wamonroe/devbox-version-sync/v1/schema/config.schema.json",
+  "tools": [
+    {
+      "name": "Go",
+      "package": "go",
+      "auto": "patch",
+      "checks": ["docker:golang:{version}-trixie"],
+      "after_update": "go mod tidy",
+      "files": [
+        { "path": "go.mod", "match": "^go (\\S+)$", "replace": "go {version}" },
+        { "path": "Dockerfile", "match": "^FROM golang:(\\S+?)-trixie", "replace": "FROM golang:{version}-trixie" }
+      ]
+    },
+    { "name": "PostgreSQL", "package": "postgresql", "auto": "minor" },
+    { "name": "Node.js", "package": "nodejs", "auto": "minor" },
+    { "package": "goose", "auto": "minor", "group": "tools" },
+    { "package": "sqlc", "auto": "minor", "group": "tools" },
+    { "package": "squawk", "auto": "minor", "group": "tools" },
+    { "package": "mailcatcher", "auto": "minor", "group": "tools" }
+  ]
+}

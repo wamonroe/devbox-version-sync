@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/wamonroe/devbox-version-sync/v1/schema/config.schema.json",
+  "tools": [
+    {
+      "name": "Ruby",
+      "package": "ruby",
+      "auto": "patch",
+      "checks": ["docker:docker.io/library/ruby:{version}-slim", "setup-ruby"],
+      "after_update": "bundle install",
+      "files": [
+        { "path": ".ruby-version", "match": "^ruby-(\\S+)$", "replace": "ruby-{version}" },
+        { "path": "Dockerfile", "match": "^ARG RUBY_VERSION=(\\S+)$", "replace": "ARG RUBY_VERSION={version}" }
+      ]
+    },
+    {
+      "name": "Bun",
+      "package": "bun",
+      "checks": ["url:https://github.com/oven-sh/bun/releases/tag/bun-v{version}"],
+      "after_update": "bun install",
+      "files": [
+        { "path": "Dockerfile", "match": "^ARG BUN_VERSION=(\\S+)$", "replace": "ARG BUN_VERSION={version}" }
+      ]
+    }
+  ]
+}

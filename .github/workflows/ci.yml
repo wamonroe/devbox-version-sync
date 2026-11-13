@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install bats
+        run: sudo apt-get update -qq && sudo apt-get install --no-install-recommends -y bats
+
+      - name: Lint shell scripts
+        run: shellcheck bin/* tests/fakes/*
+
+      - name: Run tests
+        run: bats tests
+
+      - name: Check example configs
+        run: |
+          for config in examples/*.json; do
+            jq -e '.tools | type == "array"' "$config" > /dev/null || { echo "::error file=$config::not a valid config"; exit 1; }
+          done

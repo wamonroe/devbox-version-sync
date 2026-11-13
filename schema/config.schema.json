@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/wamonroe/devbox-version-sync/v1/schema/config.schema.json",
+  "title": "devbox-version-sync config",
+  "type": "object",
+  "required": ["tools"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["package"],
+        "additionalProperties": false,
+        "properties": {
+          "package": {
+            "type": "string",
+            "description": "Package name in devbox.json."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name for pull requests and issues. Defaults to the package."
+          },
+          "auto": {
+            "enum": ["patch", "minor", "major", "none"],
+            "description": "Which releases are automatic updates: patch keeps the first two version parts (4.0.x), minor the first (4.x), major nothing; none makes every release a deliberate upgrade. Required for exact pins; otherwise implied by devbox.json."
+          },
+          "group": {
+            "type": "string",
+            "description": "Packages with the same group are updated in one pull request."
+          },
+          "checks": {
+            "type": "array",
+            "description": "What must exist before moving to a version: docker:IMAGE, url:URL or setup-ruby. {version} is replaced with the version.",
+            "items": { "type": "string", "pattern": "^(docker:.+|url:.+|setup-ruby)$" }
+          },
+          "after_update": {
+            "type": "string",
+            "description": "Command to run after pulling an update, shown in pull requests, e.g. \"bundle install\"."
+          },
+          "files": {
+            "type": "array",
+            "description": "Other files that pin the version.",
+            "items": {
+              "type": "object",
+              "required": ["path", "match", "replace"],
+              "additionalProperties": false,
+              "properties": {
+                "path": { "type": "string", "description": "File to update, relative to the project root." },
+                "match": { "type": "string", "description": "Perl regex matching exactly one line; capture group 1 is the pinned version." },
+                "replace": { "type": "string", "description": "Replacement for the matched text; {version} is the new version." },
+                "parts": { "type": "integer", "minimum": 1, "description": "Pin only the first N version parts (1 for node:24)." }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

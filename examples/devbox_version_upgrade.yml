@@ -1,0 +1,34 @@
+# Copy to .github/workflows/devbox_version_upgrade.yml in your repository. The
+# sync workflow links to it by this file name (its `upgrade-workflow` input).
+name: Devbox Version Upgrade
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Devbox package to upgrade (as in .github/devbox-version-sync.json)
+        required: true
+      version:
+        description: Version or release series to move to, e.g. "4.1". Leave blank for the newest Devbox offers.
+        required: false
+        default: ""
+
+concurrency:
+  group: devbox-version-sync
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  upgrade:
+    uses: wamonroe/devbox-version-sync/.github/workflows/upgrade.yml@v1
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: write
+    with:
+      package: ${{ inputs.package }}
+      version: ${{ inputs.version }}
+      assignees: wamonroe
+    secrets:
+      token: ${{ secrets.DEVBOX_VERSION_SYNC_TOKEN }}

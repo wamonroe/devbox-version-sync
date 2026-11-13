@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/wamonroe/devbox-version-sync/v1/schema/config.schema.json",
+  "tools": [
+    {
+      "name": "Node.js",
+      "package": "nodejs",
+      "files": [
+        { "path": ".nvmrc", "match": "^(\\S+)$", "replace": "{version}" }
+      ]
+    },
+    { "name": "Bun", "package": "bun", "after_update": "bun install" }
+  ]
+}

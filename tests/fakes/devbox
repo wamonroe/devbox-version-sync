@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# A stand-in for the devbox CLI. It resolves versions from FAKE_DEVBOX_VERSIONS
+# (lines of "package version") the way Devbox resolves specs: "latest" is the
+# newest version, anything else the newest version equal to it or starting
+# with it plus a dot. It logs each call to FAKE_DEVBOX_LOG.
+set -euo pipefail
+
+echo "devbox $*" >>"${FAKE_DEVBOX_LOG:-/dev/null}"
+
+resolve() {
+  awk -v p="$1" -v s="$2" '$1 == p && (s == "latest" || $2 == s || index($2, s ".") == 1) { print $2 }' \
+    "${FAKE_DEVBOX_VERSIONS:?}" | sort -V | tail -n 1
+}
+
+lock() {
+  local key=$1 version=$2 tmp
+  [[ -f devbox.lock ]] || echo '{"lockfile_version": "1", "packages": {}}' >devbox.lock
+  tmp=$(mktemp)
+  jq --indent 2 --arg k "$key" --arg v "$version" \
+    '.packages[$k] = {last_modified: "2026-01-01T00:00:00Z", resolved: "github:NixOS/nixpkgs/fake#\($k)", source: "devbox-search", version: $v}' \
+    devbox.lock >"$tmp"
+  mv "$tmp" devbox.lock
+}
+
+case ${1:-} in
+  init)
+    echo '{"packages": []}' >devbox.json
+    ;;
+  add)
+    pkg=${2%@*} spec=${2#*@}
+    version=$(resolve "$pkg" "$spec")
+    [[ -n $version ]] || { echo "Error: no version of $pkg matches $spec" >&2; exit 1; }
+    lock "$pkg@$spec" "$version"
+    ;;
+  update)
+    pkg=$2
+    spec=$(devbox-version-sync spec "$pkg")
+    version=$(resolve "$pkg" "$spec")
+    [[ -n $version ]] || { echo "Error: no version of $pkg matches $spec" >&2; exit 1; }
+    lock "$pkg@$spec" "$version"
+    ;;
+  *)
+    echo "fake devbox: unsupported: $*" >&2
+    exit 1
+    ;;
+esac

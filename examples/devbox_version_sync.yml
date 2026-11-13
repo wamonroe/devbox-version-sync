@@ -1,0 +1,27 @@
+# Copy to .github/workflows/devbox_version_sync.yml in your repository.
+name: Devbox Version Sync
+
+on:
+  schedule:
+    - cron: "17 14 * * 1" # Mondays, 14:17 UTC
+  workflow_dispatch:
+
+# Shared with the upgrade workflow, so the two never push at once. Don't cancel
+# a run in progress: it may be halfway through opening a pull request.
+concurrency:
+  group: devbox-version-sync
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  sync:
+    uses: wamonroe/devbox-version-sync/.github/workflows/sync.yml@v1
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    with:
+      assignees: wamonroe
+    secrets:
+      token: ${{ secrets.DEVBOX_VERSION_SYNC_TOKEN }}

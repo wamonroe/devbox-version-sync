@@ -1,0 +1,730 @@
+#!/usr/bin/env bash
+#
+# Keeps a project's version pins (version files, Dockerfiles, go.mod, ...) in
+# step with the version Devbox resolves in devbox.lock, within an update policy
+# per package. Packages and the files that pin them are listed in
+# .github/devbox-version-sync.json (DEVBOX_VERSION_SYNC_CONFIG overrides the
+# path); see README.md for the format.
+#
+# Run it from the project root (where devbox.json is).
+#
+# Usage:
+#   devbox-version-sync check                   Fail if the config is invalid or a file
+#                                               disagrees with devbox.lock.
+#   devbox-version-sync apply [PACKAGE...]      Write the devbox.lock version into the
+#                                               files (all packages by default).
+#   devbox-version-sync list                    Update groups, as JSON.
+#   devbox-version-sync info PACKAGE            Mode, policy, version and files, as JSON.
+#   devbox-version-sync update PACKAGE...       Move each package to the newest version
+#                                               its policy allows and update its files.
+#                                               Prints what changed, as JSON.
+#   devbox-version-sync upgrade-available PACKAGE
+#                                               The newest version Devbox offers, if its
+#                                               policy doesn't allow it; else nothing.
+#   devbox-version-sync upgrade PACKAGE [VERSION]
+#                                               Move to VERSION (a version or series, e.g.
+#                                               "4.1"; default the newest), whatever the
+#                                               policy. Prints what changed, as JSON.
+#   devbox-version-sync describe bump|upgrade FILE
+#                                               Pull request title, body and paths for an
+#                                               update or upgrade result, as JSON.
+#   devbox-version-sync spec PACKAGE            The version or range in devbox.json.
+#   devbox-version-sync resolve PACKAGE SPEC    The version Devbox resolves PACKAGE@SPEC to.
+#   devbox-version-sync newer VERSION_A VERSION_B
+#                                               Exit 0 if A is newer than B.
+
+set -euo pipefail
+shopt -s inherit_errexit
+
+config=${DEVBOX_VERSION_SYNC_CONFIG:-.github/devbox-version-sync.json}
+devbox_json=devbox.json
+lockfile=devbox.lock
+setup_ruby_url=${DEVBOX_VERSION_SYNC_SETUP_RUBY_URL:-https://raw.githubusercontent.com/ruby/setup-ruby/v1/ruby-builder-versions.json}
+
+tool_keys='["name", "package", "auto", "group", "checks", "after_update", "files"]'
+file_keys='["path", "match", "replace", "parts"]'
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+log() {
+  echo "$*" >&2
+}
+
+# Writes a GitHub Actions annotation (notice, warning, error), or a plain line locally.
+annotate() {
+  if [[ -n ${GITHUB_ACTIONS:-} ]]; then
+    echo "::$1::$2" >&2
+  else
+    echo "$1: $2" >&2
+  fi
+}
+
+# --- Versions ---------------------------------------------------------------
+
+valid_version() {
+  [[ $1 =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]] || die "invalid version '$1'"
+}
+
+newer() {
+  [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1) == "$1" ]]
+}
+
+components() {
+  awk -F . '{ print NF }' <<<"$1"
+}
+
+# The first N dot-separated parts of a version ("4.0.9" 2 -> "4.0").
+series() {
+  if (($2 > 0)); then
+    cut -d . -f "1-$2" <<<"$1"
+  fi
+}
+
+# --- Config -----------------------------------------------------------------
+
+require_config() {
+  [[ -f $config ]] || die "$config not found"
+  jq -e '.tools | type == "array"' "$config" >/dev/null 2>&1 || die "$config: expected a \"tools\" array"
+}
+
+# Prints the config entry for a package, or fails.
+tool() {
+  jq -ce --arg p "$1" '[.tools[] | select(.package == $p)] | if length == 1 then .[0] else empty end' "$config" ||
+    die "expected exactly one tool with \"package\": \"$1\" in $config"
+}
+
+tool_field() {
+  local entry
+  entry=$(tool "$1")
+  jq -r --arg f "$2" '.[$f] // empty' <<<"$entry"
+}
+
+display_name() {
+  local name
+  name=$(tool_field "$1" name)
+  echo "${name:-$1}"
+}
+
+file_count() {
+  local entry
+  entry=$(tool "$1")
+  jq '.files // [] | length' <<<"$entry"
+}
+
+file_field() {
+  local entry
+  entry=$(tool "$1")
+  jq -r --argjson i "$2" --arg f "$3" '.files[$i][$f] // empty' <<<"$entry"
+}
+
+checks_of() {
+  local entry
+  entry=$(tool "$1")
+  jq -r '.checks // [] | .[]' <<<"$entry"
+}
+
+# --- Policy -----------------------------------------------------------------
+#
+# A policy names how many leading version parts stay fixed for automatic
+# updates: patch keeps two (4.0.x), minor one (4.x), major none. none never
+# updates automatically.
+
+policy_fixed() {
+  case $1 in
+    patch) echo 2 ;;
+    minor) echo 1 ;;
+    major) echo 0 ;;
+    *) die "no fixed parts for policy '$1'" ;;
+  esac
+}
+
+fixed_policy() {
+  case $1 in
+    2) echo patch ;;
+    1) echo minor ;;
+    0) echo major ;;
+  esac
+}
+
+# The devbox.json range a policy needs for a version ("4.0.9" minor -> "4").
+range_for() {
+  local fixed
+  fixed=$(policy_fixed "$2")
+  if ((fixed == 0)); then
+    echo latest
+  else
+    series "$1" "$fixed"
+  fi
+}
+
+# Prints the package's policy, or fails if it doesn't fit devbox.json.
+policy() {
+  local pkg=$1 auto mode spec version implied needed
+  auto=$(tool_field "$pkg" auto)
+  case $auto in
+    "" | patch | minor | major | none) ;;
+    *) die "$pkg: auto must be patch, minor, major or none, not '$auto'" ;;
+  esac
+  mode=$(mode_of "$pkg")
+  spec=$(spec_of "$pkg")
+  case $mode in
+    latest)
+      auto=${auto:-major}
+      [[ $auto == major || $auto == none ]] ||
+        die "$pkg: devbox.json takes $pkg@latest, so every release is an automatic update. For auto: $auto, pin a range in devbox.json instead."
+      ;;
+    range)
+      version=$(locked "$pkg")
+      implied=$(fixed_policy "$(components "$spec")")
+      if [[ -z $auto ]]; then
+        [[ -n $implied ]] || die "$pkg: set auto in $config"
+        auto=$implied
+      elif [[ $auto != none && $auto != "$implied" ]]; then
+        die "$pkg: auto is $auto, but devbox.json pins the \"$spec\" range. Make them match: pin \"$(range_for "$version" "$auto")\" in devbox.json${implied:+, or set auto to $implied}."
+      fi
+      ;;
+    exact)
+      [[ -n $auto ]] || die "$pkg: devbox.json pins the exact version $spec, so set auto (patch, minor, major or none) in $config"
+      if [[ $auto != none ]] && (($(policy_fixed "$auto") >= $(components "$spec"))); then
+        needed=$(fixed_policy "$(($(components "$spec") - 1))")
+        die "$pkg: auto: $auto keeps every part of $spec fixed, so it would never update.${needed:+ For versions like $spec, use $needed.}"
+      fi
+      ;;
+  esac
+  echo "$auto"
+}
+
+# The spec whose newest version the policy allows; nothing for none.
+allowed_spec() {
+  local pkg=$1 auto mode fixed
+  auto=$(policy "$pkg")
+  [[ $auto != none ]] || return 0
+  mode=$(mode_of "$pkg")
+  case $mode in
+    latest) echo latest ;;
+    range) spec_of "$pkg" ;;
+    exact)
+      fixed=$(policy_fixed "$auto")
+      if ((fixed == 0)); then
+        echo latest
+      else
+        series "$(locked "$pkg")" "$fixed"
+      fi
+      ;;
+  esac
+}
+
+# --- devbox.json and devbox.lock ---------------------------------------------
+
+# Accepts {"pkg": "spec"}, {"pkg": {"version": "spec"}}, ["pkg@spec"] and ["pkg"].
+spec_of() {
+  local spec
+  spec=$(jq -r --arg p "$1" '
+    .packages as $pk
+    | if ($pk | type) == "object" then
+        if ($pk | has($p)) then
+          $pk[$p] | if type == "string" then . elif type == "object" then (.version // "latest") else empty end
+        else empty end
+      elif ($pk | type) == "array" then
+        [$pk[] | strings | select(. == $p or startswith($p + "@")) | if . == $p then "latest" else ltrimstr($p + "@") end]
+        | if length == 1 then .[0] else empty end
+      else empty end' "$devbox_json")
+  [[ -n $spec ]] || die "$devbox_json: expected $1 once in packages"
+  echo "$spec"
+}
+
+form_of() {
+  jq -r --arg p "$1" '
+    .packages as $pk
+    | if ($pk | type) == "object" then
+        ($pk[$p] | if type == "string" then "string" else "object" end)
+      elif any($pk[]; . == $p) then "bare"
+      else "array" end' "$devbox_json"
+}
+
+# Rewrites the package's version or range in devbox.json, keeping its layout.
+set_spec() {
+  local pkg=$1 spec=$2 form
+  valid_version "$spec"
+  form=$(form_of "$pkg")
+  FORM=$form PACKAGE=$pkg SPEC=$spec perl -0777 -i -pe '
+    my ($p, $s) = ($ENV{PACKAGE}, $ENV{SPEC});
+    if ($ENV{FORM} eq "string") {
+      $n = s/("\Q$p\E"\s*:\s*")[^"]*(")/$1$s$2/g;
+    } elsif ($ENV{FORM} eq "object") {
+      $n = s/("\Q$p\E"\s*:\s*\{[^{}]*?"version"\s*:\s*")[^"]*(")/$1$s$2/g;
+    } else {
+      $n = s/"\Q$p\E(?:\@[^"]*)?"(?=\s*[,\]])/"$p\@$s"/g;
+    }
+    END { exit($n == 1 ? 0 : 1) }' "$devbox_json" ||
+    die "$devbox_json: could not set $pkg to $spec"
+  [[ $(spec_of "$pkg") == "$spec" ]] || die "$devbox_json: failed to set $pkg to $spec"
+  log "$devbox_json -> $pkg $spec"
+}
+
+# The devbox.lock key for the package's current spec. A bare ["pkg"] may be
+# locked as "pkg" or "pkg@latest".
+lock_key() {
+  local spec
+  spec=$(spec_of "$1")
+  if [[ $(form_of "$1") == bare ]] && jq -e --arg k "$1" '.packages | has($k)' "$lockfile" >/dev/null; then
+    echo "$1"
+  else
+    echo "$1@$spec"
+  fi
+}
+
+lock_version() {
+  local key=$1 file=${2:-$lockfile} version
+  [[ -f $file ]] || die "$file not found"
+  version=$(jq -r --arg k "$key" '.packages[$k].version // empty' "$file")
+  [[ -n $version ]] || die "$file has no version for $key; run 'devbox install'"
+  echo "$version"
+}
+
+# The version devbox.lock resolves the package to.
+locked() {
+  lock_version "$(lock_key "$1")"
+}
+
+# Drops devbox.lock entries for the package's old specs.
+prune_lock() {
+  local keep tmp
+  keep=$(lock_key "$1")
+  if jq -e --arg p "$1" --arg k "$keep" '[.packages | keys[] | select((. == $p or startswith($p + "@")) and . != $k)] | length > 0' "$lockfile" >/dev/null; then
+    tmp=$(mktemp)
+    jq --indent 2 --arg p "$1" --arg k "$keep" \
+      '.packages |= with_entries(select(((.key == $p or (.key | startswith($p + "@"))) | not) or .key == $k))' "$lockfile" >"$tmp"
+    mv "$tmp" "$lockfile"
+    log "$lockfile: kept only $keep"
+  fi
+}
+
+# latest: devbox.json takes the newest release. exact: it pins the version
+# devbox.lock has. range: it pins a prefix of it ("4.0" for 4.0.9).
+mode_of() {
+  local pkg=$1 spec version
+  spec=$(spec_of "$pkg")
+  if [[ $spec == latest ]]; then
+    echo latest
+    return
+  fi
+  version=$(locked "$pkg")
+  if [[ $version == "$spec" ]]; then
+    echo exact
+  elif [[ $version == "$spec".* ]]; then
+    echo range
+  else
+    die "$lockfile resolves $pkg@$spec to $version; run 'devbox install' to refresh it"
+  fi
+}
+
+# Resolves PACKAGE@SPEC in a scratch Devbox project, leaving this one alone.
+resolve() {
+  local pkg=$1 spec=$2 dir version
+  dir=$(mktemp -d)
+  if ! (cd "$dir" && devbox init >/dev/null && devbox add "$pkg@$spec" >&2); then
+    rm -rf "$dir"
+    die "devbox could not resolve $pkg@$spec"
+  fi
+  version=$(lock_version "$pkg@$spec" "$dir/devbox.lock")
+  rm -rf "$dir"
+  valid_version "$version"
+  echo "$version"
+}
+
+# Points devbox.json at SPEC, refreshes devbox.lock and checks it resolves to
+# VERSION. Prints devbox.json if it changed.
+move_to() {
+  local pkg=$1 spec=$2 version=$3 now
+  if [[ $(spec_of "$pkg") != "$spec" ]]; then
+    set_spec "$pkg" "$spec"
+    echo "$devbox_json"
+  fi
+  devbox update "$pkg" >&2
+  prune_lock "$pkg"
+  now=$(locked "$pkg")
+  [[ $now == "$version" ]] || die "devbox.lock resolves $pkg@$spec to $now, but a scratch project resolved $version"
+}
+
+# --- Pinned files -------------------------------------------------------------
+
+# Prints the version pinned in a file, or fails unless exactly one line matches.
+file_version() {
+  local path=$1 match=$2
+  [[ -f $path ]] || die "$path not found"
+  MATCH=$match perl -ne '
+    if (/$ENV{MATCH}/) { print "$1\n"; $n++ }
+    END { exit($n == 1 ? 0 : 1) }' "$path" ||
+    die "$path: expected exactly one line matching /$match/"
+}
+
+# What file I should pin for VERSION: all of it, or its first "parts" parts.
+file_expected() {
+  local parts
+  parts=$(file_field "$1" "$2" parts)
+  if [[ -n $parts ]]; then
+    series "$3" "$parts"
+  else
+    echo "$3"
+  fi
+}
+
+# Prints "path<TAB>version<TAB>parts" for each pinned file.
+file_versions() {
+  local pkg=$1 i path version
+  for ((i = 0; i < $(file_count "$pkg"); i++)); do
+    path=$(file_field "$pkg" "$i" path)
+    version=$(file_version "$path" "$(file_field "$pkg" "$i" match)")
+    printf '%s\t%s\t%s\n' "$path" "$version" "$(file_field "$pkg" "$i" parts)"
+  done
+}
+
+file_paths() {
+  local i
+  for ((i = 0; i < $(file_count "$1"); i++)); do
+    file_field "$1" "$i" path
+  done
+}
+
+# Full versions pinned anywhere: devbox.lock, then files without "parts".
+pinned_versions() {
+  locked "$1"
+  file_versions "$1" | awk -F '\t' '$3 == "" { print $2 }'
+}
+
+in_sync() {
+  local pkg=$1 version=$2 i
+  [[ $(locked "$pkg") == "$version" ]] || return 1
+  for ((i = 0; i < $(file_count "$pkg"); i++)); do
+    [[ $(file_version "$(file_field "$pkg" "$i" path)" "$(file_field "$pkg" "$i" match)") == "$(file_expected "$pkg" "$i" "$version")" ]] || return 1
+  done
+}
+
+apply_files() {
+  local pkg=$1 version=$2 i path match replace expected
+  valid_version "$version"
+  # Validate every file before changing any, so a failure leaves nothing half-applied.
+  file_versions "$pkg" >/dev/null
+  for ((i = 0; i < $(file_count "$pkg"); i++)); do
+    path=$(file_field "$pkg" "$i" path)
+    match=$(file_field "$pkg" "$i" match)
+    replace=$(file_field "$pkg" "$i" replace)
+    expected=$(file_expected "$pkg" "$i" "$version")
+    MATCH=$match REPLACE=${replace//\{version\}/$expected} perl -i -pe 's/$ENV{MATCH}/$ENV{REPLACE}/' "$path"
+    [[ $(file_version "$path" "$match") == "$expected" ]] || die "$path: failed to set version $expected"
+    log "$path -> $expected"
+  done
+}
+
+# --- Availability checks ------------------------------------------------------
+
+valid_check() {
+  case $1 in
+    docker:?* | url:?* | setup-ruby) ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints why VERSION isn't available yet and fails, or succeeds quietly.
+run_checks() {
+  local pkg=$1 version=$2 check target
+  while IFS= read -r check; do
+    target=${check//\{version\}/$version}
+    case $target in
+      docker:?*)
+        docker manifest inspect "${target#docker:}" >/dev/null 2>&1 ||
+          { echo "${target#docker:} is not published yet"; return 1; }
+        ;;
+      url:?*)
+        curl -fsSLI -o /dev/null "${target#url:}" 2>/dev/null ||
+          { echo "${target#url:} is not available yet"; return 1; }
+        ;;
+      setup-ruby)
+        curl -fsSL "$setup_ruby_url" 2>/dev/null | jq -e --arg v "$version" '.ruby | any(.[]; . == $v)' >/dev/null ||
+          { echo "ruby/setup-ruby doesn't offer Ruby $version yet"; return 1; }
+        ;;
+      *) die "$pkg: unknown check '$check'" ;;
+    esac
+  done < <(checks_of "$pkg")
+}
+
+# --- Results --------------------------------------------------------------------
+
+# CHANGED is devbox.json if move_to changed it, else empty.
+result_json() {
+  local pkg=$1 from=$2 to=$3 from_spec=$4 to_spec=$5 changed=$6 paths
+  mapfile -t paths < <(changed_paths "$pkg" "$changed")
+  jq -nc --arg package "$pkg" --arg name "$(display_name "$pkg")" \
+    --arg from "$from" --arg to "$to" --arg from_spec "$from_spec" --arg to_spec "$to_spec" \
+    --arg after "$(tool_field "$pkg" after_update)" \
+    '{package: $package, name: $name, from: $from, to: $to, from_spec: $from_spec, to_spec: $to_spec,
+      after_update: (if $after == "" then null else $after end), paths: $ARGS.positional}' --args "${paths[@]}"
+}
+
+# --- Commands ---------------------------------------------------------------
+
+check_package() {
+  local pkg=$1 auto version check bad=0 path value parts expected
+  auto=$(policy "$pkg")
+  version=$(locked "$pkg")
+  while IFS= read -r check; do
+    valid_check "$check" || { echo "error: $pkg: unknown check '$check' (use docker:IMAGE, url:URL or setup-ruby)" >&2; bad=1; }
+  done < <(checks_of "$pkg")
+  local i=0 versions
+  versions=$(file_versions "$pkg")
+  while IFS=$'\t' read -r path value parts; do
+    [[ -n $path ]] || continue
+    expected=$(file_expected "$pkg" "$i" "$version")
+    if [[ $value != "$expected" ]]; then
+      echo "error: $path pins $pkg $value, but $lockfile has $version${parts:+ (so $path should pin $expected)}. Run 'devbox-version-sync apply $pkg'." >&2
+      bad=1
+    fi
+    i=$((i + 1))
+  done <<<"$versions"
+  ((bad == 0)) || return 1
+  echo "$pkg $version ($(mode_of "$pkg") \"$(spec_of "$pkg")\", auto: $auto)$(file_paths "$pkg" | sed 's/^/ /' | tr -d '\n')"
+}
+
+cmd_check() {
+  local status=0 pkg problems line
+  problems=$(jq -r --argjson tk "$tool_keys" --argjson fk "$file_keys" '
+    .tools | to_entries[]
+    | (.value.package // "tools[\(.key)]") as $p
+    | ((.value | keys) - $tk | .[] | "\($p): unknown key \"\(.)\""),
+      (if (.value.package | type) != "string" then "\($p): missing \"package\"" else empty end),
+      (.value.files // [] | .[] | ((keys - $fk | .[] | "\($p): unknown file key \"\(.)\""),
+        (["path", "match", "replace"] - keys | .[] | "\($p): file is missing \"\(.)\"")))' "$config")
+  problems+=$(jq -r '[.tools[].package] | group_by(.) | .[] | select(length > 1) | "\(.[0]): listed more than once"' "$config")
+  if [[ -n $problems ]]; then
+    while IFS= read -r line; do echo "error: $line"; done <<<"$problems" >&2
+    return 1
+  fi
+  # A subshell per package, so one failure doesn't hide the rest. Not in a
+  # condition (`|| status=1`), where errexit would be off inside it.
+  for pkg in $(jq -r '.tools[].package' "$config"); do
+    set +e
+    (
+      set -e
+      check_package "$pkg"
+    )
+    # shellcheck disable=SC2181
+    (($? == 0)) || status=1
+    set -e
+  done
+  return "$status"
+}
+
+cmd_apply() {
+  local pkg
+  if (($# == 0)); then
+      # shellcheck disable=SC2046
+    set -- $(jq -r '.tools[].package' "$config")
+  fi
+  for pkg in "$@"; do
+    apply_files "$pkg" "$(locked "$pkg")"
+  done
+}
+
+cmd_list() {
+  jq -c '
+    reduce (.tools[] | {name: (.group // .package), package}) as $t ([];
+      (map(.name) | index($t.name)) as $i
+      | if $i == null then . + [{name: $t.name, packages: [$t.package]}]
+        else .[$i].packages += [$t.package] end)' "$config"
+}
+
+# What automatic updates follow, for messages: "4.0.x", "every release" or nothing.
+follows() {
+  local auto=$1 version=$2 fixed
+  [[ $auto != none ]] || return 0
+  fixed=$(policy_fixed "$auto")
+  if ((fixed == 0)); then
+    echo "every release"
+  else
+    echo "$(series "$version" "$fixed").x"
+  fi
+}
+
+cmd_info() {
+  local pkg=$1 files auto version
+  mapfile -t files < <(file_paths "$pkg")
+  auto=$(policy "$pkg")
+  version=$(locked "$pkg")
+  jq -nc --arg package "$pkg" --arg name "$(display_name "$pkg")" --arg mode "$(mode_of "$pkg")" \
+    --arg spec "$(spec_of "$pkg")" --arg auto "$auto" --arg follows "$(follows "$auto" "$version")" \
+    --arg version "$version" --arg after "$(tool_field "$pkg" after_update)" \
+    '{package: $package, name: $name, mode: $mode, spec: $spec, auto: $auto,
+      follows: (if $follows == "" then null else $follows end), version: $version,
+      after_update: (if $after == "" then null else $after end), files: $ARGS.positional}' \
+    --args "$lockfile" "${files[@]}"
+}
+
+update_one() {
+  local pkg=$1 name auto allowed target pins highest from failure spec changed
+  name=$(display_name "$pkg")
+  auto=$(policy "$pkg")
+  if [[ $auto == none ]]; then
+    log "$pkg: auto is none; use the upgrade workflow to move it."
+    return 0
+  fi
+  allowed=$(allowed_spec "$pkg")
+  target=$(resolve "$pkg" "$allowed")
+  if in_sync "$pkg" "$target"; then
+    log "$pkg: Devbox resolves $pkg@$allowed to $target, which is already pinned. Nothing to do."
+    return 0
+  fi
+  pins=$(pinned_versions "$pkg" | sort -V)
+  highest=$(tail -n 1 <<<"$pins")
+  from=$(head -n 1 <<<"$pins")
+  if newer "$highest" "$target"; then
+    annotate warning "$pkg is pinned at $highest, but Devbox resolves $pkg@$allowed to $target. Leaving it alone."
+    return 0
+  fi
+  if ! failure=$(run_checks "$pkg" "$target"); then
+    annotate notice "Devbox offers $name $target, but $failure. Will retry next run."
+    return 0
+  fi
+  spec=$(spec_of "$pkg")
+  if [[ $(mode_of "$pkg") == exact ]]; then
+    changed=$(move_to "$pkg" "$target" "$target")
+  else
+    changed=$(move_to "$pkg" "$spec" "$target")
+  fi
+  apply_files "$pkg" "$target"
+  check_package "$pkg" >&2
+  result_json "$pkg" "$from" "$target" "$spec" "$(spec_of "$pkg")" "$changed"
+}
+
+# Prints the paths a change touched: devbox.json if it changed, devbox.lock, the files.
+changed_paths() {
+  if [[ -n $2 ]]; then echo "$2"; fi
+  echo "$lockfile"
+  file_paths "$1"
+}
+
+cmd_update() {
+  local pkg results=""
+  (($# > 0)) || die "update needs at least one package"
+  for pkg in "$@"; do
+    results+=$(update_one "$pkg")$'\n'
+  done
+  jq -cs . <<<"$results"
+}
+
+upgrade_available() {
+  local pkg=$1 auto current latest fixed
+  auto=$(policy "$pkg")
+  current=$(locked "$pkg")
+  latest=$(resolve "$pkg" latest)
+  newer "$latest" "$current" || return 0
+  case $auto in
+    none) echo "$latest" ;;
+    major) ;;
+    *)
+      fixed=$(policy_fixed "$auto")
+      if newer "$(series "$latest" "$fixed")" "$(series "$current" "$fixed")"; then
+        echo "$latest"
+      fi
+      ;;
+  esac
+}
+
+cmd_upgrade() {
+  local pkg=$1 requested=${2:-} name mode spec current target failure new_spec changed
+  name=$(display_name "$pkg")
+  policy "$pkg" >/dev/null
+  mode=$(mode_of "$pkg")
+  spec=$(spec_of "$pkg")
+  current=$(locked "$pkg")
+  if [[ $mode == latest && -n $requested ]]; then
+    die "devbox.json takes $pkg@latest, so it can only move to the newest version. Pin a range in devbox.json to choose one."
+  fi
+  [[ -z $requested ]] || valid_version "$requested"
+  target=$(resolve "$pkg" "${requested:-latest}")
+  newer "$target" "$current" ||
+    die "Devbox resolves $pkg@${requested:-latest} to $target, which is not newer than $current."
+  if ! failure=$(run_checks "$pkg" "$target"); then
+    die "Devbox offers $name $target, but $failure. Try again later."
+  fi
+  case $mode in
+    range) new_spec=$(series "$target" "$(components "$spec")") ;;
+    exact) new_spec=$target ;;
+    latest) new_spec=latest ;;
+  esac
+  changed=$(move_to "$pkg" "$new_spec" "$target")
+  apply_files "$pkg" "$target"
+  check_package "$pkg" >&2
+  # shellcheck disable=SC2046
+  result_json "$pkg" "$current" "$target" "$spec" "$new_spec" "$changed" | jq -cs .
+}
+
+cmd_describe() {
+  local kind=$1 file=$2
+  [[ $kind == bump || $kind == upgrade ]] || die "describe: kind must be bump or upgrade"
+  jq -c --arg kind "$kind" '
+    def sentence: if length <= 2 then join(" and ") else (.[:-1] | join(", ")) + " and " + .[-1] end;
+    def code: "`\(.)`";
+    (map(.after_update // empty | select(. != "")) | unique) as $after
+    | ([.[].paths[]] | to_entries | unique_by(.value) | sort_by(.key) | map(.value)) as $paths
+    | {
+        title: ((if $kind == "upgrade" then "Upgrade " else "Bump " end)
+          + (if length == 1 then "\(.[0].name) from \(.[0].from) to \(.[0].to)"
+             else map("\(.name) to \(.to)") | sentence end)),
+        paths: ($paths | join("\n")),
+        body: ([
+          (if $kind == "upgrade" then
+             (.[] | if .from_spec != .to_spec and .from_spec != .from
+                    then "Moves \(.package | code) from the \(.from_spec | code) range in `devbox.json` to \(.to_spec | code), which Devbox resolves to \(.to). This is beyond its automatic update policy, so it may include breaking changes."
+                    else "Moves \(.package | code) from \(.from) to \(.to). This is beyond its automatic update policy, so it may include breaking changes." end)
+           else
+             "Devbox now offers newer versions within each package'"'"'s update policy, so this bumps their pins together."
+           end),
+          "",
+          "| Package | From | To |",
+          "| --- | --- | --- |",
+          (.[] | "| \(.name) (\(.package | code)) | \(.from) | \(.to) |"),
+          "",
+          "Files updated together:",
+          "",
+          ($paths[] | "- \(code)"),
+          "",
+          (if $kind == "upgrade" then
+             "Before merging:",
+             "",
+             (.[] | "- [ ] Read the release notes for \(.name) \(.to)"),
+             "- [ ] CI passes, including any Docker image build",
+             "- [ ] Pull this branch, run `devbox install`\(if ($after | length) > 0 then ", then \($after | map(code) | sentence)," else "" end) and try the app locally"
+           elif ($after | length) > 0 then
+             "After merging, pull and run `devbox install`, then:",
+             "",
+             ($after[] | "- \(code)")
+           else
+             "After merging, pull and run `devbox install` to get the new versions."
+           end)
+        ] | join("\n"))
+      }' "$file"
+}
+
+command=${1:-}
+shift || true
+case $command in
+  check) require_config && cmd_check ;;
+  apply) require_config && cmd_apply "$@" ;;
+  list) require_config && cmd_list ;;
+  info) require_config && cmd_info "${1:?package}" ;;
+  update) require_config && cmd_update "$@" ;;
+  upgrade-available) require_config && upgrade_available "${1:?package}" ;;
+  upgrade) require_config && cmd_upgrade "${1:?package}" "${2:-}" ;;
+  describe) cmd_describe "${1:?bump or upgrade}" "${2:?result file}" ;;
+  spec) spec_of "${1:?package}" ;;
+  resolve) resolve "${1:?package}" "${2:?spec}" ;;
+  newer) newer "${1:?version}" "${2:?version}" ;;
+  *)
+    sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 64
+    ;;
+esac

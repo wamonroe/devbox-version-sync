@@ -1,0 +1,212 @@
+name: Devbox Version Sync
+
+# Reusable workflow. Moves each package in the caller's config to the newest
+# version Devbox offers within its update policy, and bumps the files that pin
+# it, in one pull request per package or group. If Devbox has nothing newer, or
+# a check (such as a Docker image) isn't ready yet, it does nothing and the
+# next run checks again.
+#
+# Releases beyond a package's policy (Ruby 4.1 when it follows 4.0.x) get an
+# issue labelled `issue-label`, a callout on the pull request and a note in
+# the run summary; run the caller's upgrade workflow to move to them. The
+# issue is updated as newer versions appear and closed once there's nothing
+# beyond the policy.
+#
+# The caller grants contents, issues and pull-requests write. Pull requests
+# opened with the default GITHUB_TOKEN don't trigger CI, so pass a `token`
+# secret (a fine-grained PAT with Contents and Pull requests write access) for
+# them to. See README.md.
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: Path to the config file.
+        type: string
+        default: .github/devbox-version-sync.json
+      assignees:
+        description: Comma-separated GitHub users to assign pull requests and issues to.
+        type: string
+        default: ""
+      upgrade-workflow:
+        description: File name of the caller's upgrade workflow, linked from issues.
+        type: string
+        default: devbox_version_upgrade.yml
+      issue-label:
+        description: Label for issues about releases beyond a package's policy.
+        type: string
+        default: devbox-version-upgrade
+    secrets:
+      token:
+        description: Token for opening pull requests, so they trigger CI. Defaults to GITHUB_TOKEN.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  list:
+    name: List packages
+    runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.list.outputs.groups }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up devbox-version-sync
+        uses: wamonroe/devbox-version-sync@v1
+
+      - name: List update groups
+        id: list
+        env:
+          DEVBOX_VERSION_SYNC_CONFIG: ${{ inputs.config }}
+        run: echo "groups=$(devbox-version-sync list)" >> "$GITHUB_OUTPUT"
+
+  update:
+    name: Update ${{ matrix.group.name }}
+    needs: list
+    if: needs.list.outputs.groups != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.list.outputs.groups) }}
+    env:
+      DEVBOX_VERSION_SYNC_CONFIG: ${{ inputs.config }}
+      PACKAGES: ${{ join(matrix.group.packages, ' ') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Devbox
+        uses: jetify-com/devbox-install-action@v0.15.0
+        with:
+          enable-cache: true
+
+      - name: Set up devbox-version-sync
+        uses: wamonroe/devbox-version-sync@v1
+
+      - name: Update within each package's policy
+        id: update
+        run: |
+          read -ra packages <<< "$PACKAGES"
+          result=$RUNNER_TEMP/result.json
+          devbox-version-sync update "${packages[@]}" > "$result"
+          if [[ $(jq length "$result") -eq 0 ]]; then
+            echo "Nothing to update for ${packages[*]}."
+            exit 0
+          fi
+
+          pr=$(devbox-version-sync describe bump "$result")
+          delimiter=$(cat /proc/sys/kernel/random/uuid)
+          {
+            echo "update=true"
+            echo "title=$(jq -r .title <<< "$pr")"
+            echo "paths<<$delimiter"
+            jq -r .paths <<< "$pr"
+            echo "$delimiter"
+            echo "body<<$delimiter"
+            jq -r .body <<< "$pr"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Track releases beyond each package's policy
+        id: upgrade
+        # A Devbox hiccup here shouldn't stop the pull request, or close an issue.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ inputs.issue-label }}
+          ASSIGNEES: ${{ inputs.assignees }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/${{ inputs.upgrade-workflow }}
+        run: |
+          read -ra packages <<< "$PACKAGES"
+          assign=()
+          if [[ -n $ASSIGNEES ]]; then assign=(--assignee "$ASSIGNEES"); fi
+          alerts=""
+          status=0
+
+          for pkg in "${packages[@]}"; do
+            if ! version=$(devbox-version-sync upgrade-available "$pkg"); then
+              echo "::warning::Couldn't check $pkg for releases beyond its policy. Leaving its issue as it is."
+              status=1
+              continue
+            fi
+            info=$(devbox-version-sync info "$pkg")
+            name=$(jq -r .name <<< "$info")
+            auto=$(jq -r .auto <<< "$info")
+            follows=$(jq -r '.follows // empty' <<< "$info")
+            marker="<!-- devbox-version-upgrade:$pkg -->"
+            number=$(MARKER=$marker gh issue list --label "$LABEL" --state open --limit 100 --json number,body \
+              --jq '[.[] | select(.body | contains(env.MARKER)) | .number] | first // empty')
+
+            if [[ -z $version ]]; then
+              echo "No release of $pkg beyond its policy (auto: $auto)."
+              if [[ -n $number ]]; then
+                gh issue close "$number" --reason completed \
+                  --comment "Devbox offers nothing newer for $name than its \`auto: $auto\` policy covers. Closing."
+              fi
+              continue
+            fi
+
+            if [[ -n $follows ]]; then
+              policy="Automatic updates for \`$pkg\` follow $follows (\`auto: $auto\`)"
+            else
+              policy="Automatic updates for \`$pkg\` are off (\`auto: none\`)"
+            fi
+            files=$(jq -r '["devbox.json"] + .files | .[] | "- `\(.)`"' <<< "$info")
+            title="Upgrade $name to $version"
+            body="$marker
+          Devbox now offers **$name $version**. $policy, so this one needs a deliberate upgrade.
+
+          To upgrade, run the [Devbox Version Upgrade]($WORKFLOW_URL) workflow for \`$pkg\`. It opens a pull request that updates these together:
+
+          $files
+
+          The weekly Devbox Version Sync workflow keeps this issue up to date and closes it once there's nothing newer than the policy covers. Merging the upgrade pull request also closes it."
+
+            if [[ -n $number ]]; then
+              gh issue edit "$number" --title "$title" --body "$body"
+            else
+              gh label create "$LABEL" --force --color 1D76DB \
+                --description "A release beyond a package's Devbox update policy is available"
+              url=$(gh issue create --title "$title" --body "$body" --label "$LABEL" "${assign[@]}")
+              number=${url##*/}
+            fi
+
+            alert="> [!IMPORTANT]
+          > **$name $version is available.** $policy, so it needs a deliberate upgrade: run the [Devbox Version Upgrade]($WORKFLOW_URL) workflow for \`$pkg\`. Tracked in #$number."
+            echo "::notice::$name $version is available beyond its policy. Run the Devbox Version Upgrade workflow to upgrade."
+            echo "$alert" >> "$GITHUB_STEP_SUMMARY"
+            alerts+="$alert"$'\n\n'
+          done
+
+          delimiter=$(cat /proc/sys/kernel/random/uuid)
+          {
+            echo "alerts<<$delimiter"
+            echo "$alerts"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Open pull request
+        if: steps.update.outputs.update == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.token || github.token }}
+          branch: devbox-version-sync/${{ matrix.group.name }}
+          delete-branch: true
+          add-paths: ${{ steps.update.outputs.paths }}
+          commit-message: ${{ steps.update.outputs.title }}
+          title: ${{ steps.update.outputs.title }}
+          assignees: ${{ inputs.assignees }}
+          body: |
+            ${{ steps.upgrade.outputs.alerts }}${{ steps.update.outputs.body }}
+
+            Opened by the [Devbox Version Sync](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow.

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# A stand-in for `docker manifest inspect IMAGE`: every image exists except
+# those listed in FAKE_DOCKER_MISSING (one per line).
+set -euo pipefail
+[[ $1 == manifest && $2 == inspect ]] || { echo "fake docker: unsupported: $*" >&2; exit 1; }
+if [[ -n ${FAKE_DOCKER_MISSING:-} ]] && grep -qxF "$3" "$FAKE_DOCKER_MISSING"; then
+  echo "no such manifest: $3" >&2
+  exit 1
+fi
+echo '{}'

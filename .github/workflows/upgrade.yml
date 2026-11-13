@@ -1,0 +1,112 @@
+name: Devbox Version Upgrade
+
+# Reusable workflow. Moves one package in the caller's config beyond its
+# automatic update policy (e.g. Ruby 4.0 -> 4.1): updates devbox.json and
+# devbox.lock, and bumps the files that pin it, in one pull request. The
+# pull request closes the issue the sync workflow opened about the release.
+#
+# The caller grants contents and pull-requests write, and issues read. Pass a
+# `token` secret for the pull request to trigger CI, as with the sync workflow.
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: Devbox package to upgrade, as in the config.
+        type: string
+        required: true
+      version:
+        description: Version or release series to move to, e.g. "4.1". Blank for the newest Devbox offers.
+        type: string
+        default: ""
+      config:
+        description: Path to the config file.
+        type: string
+        default: .github/devbox-version-sync.json
+      assignees:
+        description: Comma-separated GitHub users to assign the pull request to.
+        type: string
+        default: ""
+      issue-label:
+        description: Label of the sync workflow's issues, to find the one this closes.
+        type: string
+        default: devbox-version-upgrade
+    secrets:
+      token:
+        description: Token for opening the pull request, so it triggers CI. Defaults to GITHUB_TOKEN.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade:
+    name: Upgrade ${{ inputs.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: read
+      pull-requests: write
+    env:
+      DEVBOX_VERSION_SYNC_CONFIG: ${{ inputs.config }}
+      PACKAGE: ${{ inputs.package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Devbox
+        uses: jetify-com/devbox-install-action@v0.15.0
+        with:
+          enable-cache: true
+
+      - name: Set up devbox-version-sync
+        uses: wamonroe/devbox-version-sync@v1
+
+      - name: Upgrade
+        id: upgrade
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          result=$RUNNER_TEMP/result.json
+          devbox-version-sync upgrade "$PACKAGE" "$VERSION" > "$result"
+
+          pr=$(devbox-version-sync describe upgrade "$result")
+          delimiter=$(cat /proc/sys/kernel/random/uuid)
+          {
+            echo "title=$(jq -r .title <<< "$pr")"
+            echo "paths<<$delimiter"
+            jq -r .paths <<< "$pr"
+            echo "$delimiter"
+            echo "body<<$delimiter"
+            jq -r .body <<< "$pr"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Find the upgrade issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ inputs.issue-label }}
+          MARKER: "<!-- devbox-version-upgrade:${{ inputs.package }} -->"
+        run: |
+          number=$(gh issue list --label "$LABEL" --state open --limit 100 --json number,body \
+            --jq '[.[] | select(.body | contains(env.MARKER)) | .number] | first // empty')
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.token || github.token }}
+          branch: devbox-version-upgrade/${{ inputs.package }}
+          delete-branch: true
+          add-paths: ${{ steps.upgrade.outputs.paths }}
+          commit-message: ${{ steps.upgrade.outputs.title }}
+          title: ${{ steps.upgrade.outputs.title }}
+          assignees: ${{ inputs.assignees }}
+          body: |
+            ${{ steps.upgrade.outputs.body }}
+
+            ${{ steps.issue.outputs.number && format('Closes #{0}.', steps.issue.outputs.number) || '' }}
+
+            Opened by the [Devbox Version Upgrade](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow. Once merged, the weekly Devbox Version Sync workflow keeps it updated within its policy.
