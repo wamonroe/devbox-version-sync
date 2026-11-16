@@ -197,7 +197,7 @@ jobs:
 
       - name: Open pull request
         if: steps.update.outputs.update == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.token || github.token }}
           branch: devbox-version-sync/${{ matrix.group.name }}
