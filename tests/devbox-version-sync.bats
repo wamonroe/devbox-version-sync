@@ -364,6 +364,28 @@ EOF
   [ "$(tail -n 1 <<<"$output")" = "[]" ]
 }
 
+@test "update records what it did with each package" {
+  ruby_project
+  echo "docker.io/library/ruby:4.0.9-slim" >"$FAKE_DOCKER_MISSING"
+  export DEVBOX_VERSION_SYNC_STATUS_FILE=$BATS_TEST_TMPDIR/status
+  devbox-version-sync update ruby >/dev/null 2>&1
+  [ "$(cat "$DEVBOX_VERSION_SYNC_STATUS_FILE")" = $'ruby\twaiting' ]
+  : >"$FAKE_DOCKER_MISSING"
+  devbox-version-sync update ruby >/dev/null 2>&1
+  devbox-version-sync update ruby >/dev/null 2>&1
+  [ "$(cat "$DEVBOX_VERSION_SYNC_STATUS_FILE")" = $'ruby\twaiting\nruby\tupdated\nruby\tcurrent' ]
+}
+
+@test "update records ahead and none" {
+  ruby_project
+  echo "ruby-4.0.10" >.ruby-version
+  export DEVBOX_VERSION_SYNC_STATUS_FILE=$BATS_TEST_TMPDIR/status
+  devbox-version-sync update ruby >/dev/null 2>&1
+  jq '.tools[0].auto = "none"' .github/devbox-version-sync.json >c && mv c .github/devbox-version-sync.json
+  devbox-version-sync update ruby >/dev/null 2>&1
+  [ "$(cat "$DEVBOX_VERSION_SYNC_STATUS_FILE")" = $'ruby\tahead\nruby\tnone' ]
+}
+
 # --- upgrade-available --------------------------------------------------------------
 
 @test "upgrade-available reports a release beyond the policy" {

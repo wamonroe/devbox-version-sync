@@ -17,7 +17,12 @@
 #   devbox-version-sync info PACKAGE            Mode, policy, version and files, as JSON.
 #   devbox-version-sync update PACKAGE...       Move each package to the newest version
 #                                               its policy allows and update its files.
-#                                               Prints what changed, as JSON.
+#                                               Prints what changed, as JSON. With
+#                                               DEVBOX_VERSION_SYNC_STATUS_FILE set, also
+#                                               appends "package<TAB>status" lines to it:
+#                                               updated, current (nothing newer), waiting
+#                                               (a check failed), ahead (pinned newer than
+#                                               Devbox resolves) or none (auto: none).
 #   devbox-version-sync upgrade-available PACKAGE
 #                                               The newest version Devbox offers, if its
 #                                               policy doesn't allow it; else nothing.
@@ -39,6 +44,7 @@ shopt -s inherit_errexit
 config=${DEVBOX_VERSION_SYNC_CONFIG:-.github/devbox-version-sync.json}
 devbox_json=devbox.json
 lockfile=devbox.lock
+status_file=${DEVBOX_VERSION_SYNC_STATUS_FILE:-}
 setup_ruby_url=${DEVBOX_VERSION_SYNC_SETUP_RUBY_URL:-https://raw.githubusercontent.com/ruby/setup-ruby/v1/ruby-builder-versions.json}
 
 tool_keys='["name", "package", "auto", "group", "checks", "after_update", "files"]'
@@ -563,18 +569,27 @@ cmd_info() {
     --args "$lockfile" "${files[@]}"
 }
 
+# Records what update did with a package, for the workflow.
+record_status() {
+  if [[ -n $status_file ]]; then
+    printf '%s\t%s\n' "$1" "$2" >>"$status_file"
+  fi
+}
+
 update_one() {
   local pkg=$1 name auto allowed target pins highest from failure spec changed
   name=$(display_name "$pkg")
   auto=$(policy "$pkg")
   if [[ $auto == none ]]; then
     log "$pkg: auto is none; use the upgrade workflow to move it."
+    record_status "$pkg" none
     return 0
   fi
   allowed=$(allowed_spec "$pkg")
   target=$(resolve "$pkg" "$allowed")
   if in_sync "$pkg" "$target"; then
     log "$pkg: Devbox resolves $pkg@$allowed to $target, which is already pinned. Nothing to do."
+    record_status "$pkg" current
     return 0
   fi
   pins=$(pinned_versions "$pkg" | sort -V)
@@ -582,10 +597,12 @@ update_one() {
   from=$(head -n 1 <<<"$pins")
   if newer "$highest" "$target"; then
     annotate warning "$pkg is pinned at $highest, but Devbox resolves $pkg@$allowed to $target. Leaving it alone."
+    record_status "$pkg" ahead
     return 0
   fi
   if ! failure=$(run_checks "$pkg" "$target"); then
     annotate notice "Devbox offers $name $target, but $failure. Will retry next run."
+    record_status "$pkg" waiting
     return 0
   fi
   spec=$(spec_of "$pkg")
@@ -596,6 +613,7 @@ update_one() {
   fi
   apply_files "$pkg" "$target"
   check_package "$pkg" >&2
+  record_status "$pkg" updated
   result_json "$pkg" "$from" "$target" "$spec" "$(spec_of "$pkg")" "$changed"
 }
 

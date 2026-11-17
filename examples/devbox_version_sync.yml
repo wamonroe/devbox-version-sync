@@ -5,6 +5,11 @@ on:
   schedule:
     - cron: "17 14 * * 1" # Mondays, 14:17 UTC
   workflow_dispatch:
+  # Merging one sync pull request changes devbox.lock under the others; a run
+  # straight after rebuilds them on the new main, so they don't conflict.
+  push:
+    branches: [main]
+    paths: [devbox.json, devbox.lock]
 
 # Shared with the upgrade workflow, so the two never push at once. Don't cancel
 # a run in progress: it may be halfway through opening a pull request.

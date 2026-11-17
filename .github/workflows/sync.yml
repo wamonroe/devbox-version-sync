@@ -12,6 +12,12 @@ name: Devbox Version Sync
 # issue is updated as newer versions appear and closed once there's nothing
 # beyond the policy.
 #
+# While a run works on a group whose pull request is open, a notice at the top
+# of that pull request asks people not to merge or push to it; the rebuilt
+# description replaces it, or a final step removes it. If a run finds every
+# package in a group already current (updated by hand, say), it closes that
+# group's pull request.
+#
 # The caller grants contents, issues and pull-requests write. Pull requests
 # opened with the default GITHUB_TOKEN don't trigger CI, so pass a `token`
 # secret (a fine-grained PAT with Contents and Pull requests write access) for
@@ -80,9 +86,38 @@ jobs:
     env:
       DEVBOX_VERSION_SYNC_CONFIG: ${{ inputs.config }}
       PACKAGES: ${{ join(matrix.group.packages, ' ') }}
+      BRANCH: devbox-version-sync/${{ matrix.group.name }}
+      GH_REPO: ${{ github.repository }}
+      NOTICE_START: "<!-- devbox-version-sync:updating -->"
+      NOTICE_END: "<!-- /devbox-version-sync:updating -->"
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Mark the open pull request as being updated
+        id: notice
+        # A notice is a courtesy; failing to post one shouldn't stop the update.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          if [[ -z $number ]]; then
+            echo "No open pull request for $BRANCH."
+            exit 0
+          fi
+
+          # Drop a notice a killed run left behind, then put this run's on top.
+          body=$(gh pr view "$number" --json body --jq .body |
+            perl -0pe 's/\Q$ENV{NOTICE_START}\E.*?\Q$ENV{NOTICE_END}\E\n*//gs')
+          notice="$NOTICE_START
+          > [!NOTE]
+          > Devbox Version Sync is updating this pull request ([run]($RUN_URL)). Please don't merge or push to it until this notice goes away: the update may replace the branch.
+          $NOTICE_END"
+          gh pr edit "$number" --body "$notice"$'\n\n'"$body"
+          echo "Marked #$number as being updated."
 
       - name: Install Devbox
         uses: jetify-com/devbox-install-action@v0.16.0
@@ -97,9 +132,17 @@ jobs:
         run: |
           read -ra packages <<< "$PACKAGES"
           result=$RUNNER_TEMP/result.json
+          export DEVBOX_VERSION_SYNC_STATUS_FILE=$RUNNER_TEMP/status.tsv
+          : > "$DEVBOX_VERSION_SYNC_STATUS_FILE"
           devbox-version-sync update "${packages[@]}" > "$result"
           if [[ $(jq length "$result") -eq 0 ]]; then
             echo "Nothing to update for ${packages[*]}."
+            # Every package already current (or auto: none) means an open
+            # pull request for the group isn't needed. One waiting on a
+            # check, or pinned ahead of Devbox, keeps it open.
+            if ! awk -F '\t' '$2 != "current" && $2 != "none" { found = 1 } END { exit !found }' "$DEVBOX_VERSION_SYNC_STATUS_FILE"; then
+              echo "current=true" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
 
@@ -210,3 +253,31 @@ jobs:
             ${{ steps.upgrade.outputs.alerts }}${{ steps.update.outputs.body }}
 
             Opened by the [Devbox Version Sync](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow.
+
+      - name: Close the pull request if it's no longer needed
+        if: steps.update.outcome == 'success' && steps.update.outputs.current == 'true' && steps.notice.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.notice.outputs.number }}
+        run: |
+          read -ra packages <<< "$PACKAGES"
+          versions=$(for pkg in "${packages[@]}"; do devbox-version-sync info "$pkg"; done |
+            jq -rs 'map("\(.name) \(.version)") | join(", ")')
+          gh pr close "$NUMBER" --delete-branch \
+            --comment "\`devbox.lock\` on the default branch is already at the newest version Devbox offers within each package's policy ($versions), so this pull request isn't needed anymore. Closing."
+
+      - name: Remove the update notice
+        # Also after a failure or cancellation, so the notice doesn't linger.
+        if: always() && steps.notice.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.notice.outputs.number }}
+        run: |
+          body=$(gh pr view "$NUMBER" --json body --jq .body)
+          if [[ $body != *"$NOTICE_START"* ]]; then
+            echo "#$NUMBER has no update notice (its description was rebuilt)."
+            exit 0
+          fi
+          body=$(perl -0pe 's/\Q$ENV{NOTICE_START}\E.*?\Q$ENV{NOTICE_END}\E\n*//gs' <<< "$body")
+          gh pr edit "$NUMBER" --body "$body"
+          echo "Removed the update notice from #$NUMBER."
