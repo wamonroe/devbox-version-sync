@@ -74,6 +74,10 @@ The policy has to fit how `devbox.json` pins the package. `devbox.json` can list
 
 **Sync** (`.github/workflows/sync.yml`, run weekly) opens one pull request per package or group, on the branch `devbox-version-sync/<package or group>`. For each release beyond a package's policy, it opens or updates an issue (labelled `devbox-version-upgrade`), adds a callout to the pull request and notes it in the run summary. It closes the issue once nothing is beyond the policy.
 
+Each group always uses the same branch, so a run updates the group's open pull request in place (force-pushing a rebuilt branch) instead of opening another. While a run works on it, a notice at the top of the pull request asks people not to merge or push to it; the run removes the notice when it's done, whatever the outcome. Commits pushed to the branch by hand are lost if a run rebuilds it, so merge soon after pushing one (an sqlc bump's regenerated code, say). If a run finds every package in a group already current, because someone updated them by hand, it closes the group's pull request with a comment saying so. A package waiting on a check keeps its pull request open.
+
+Merging one sync pull request changes `devbox.lock` under the others, which can make them conflict. The example caller also runs on pushes to `main` that change `devbox.json` or `devbox.lock`, so the open pull requests are rebuilt on the new `main` a couple of minutes after each merge.
+
 | Input | Default | |
 | --- | --- | --- |
 | `config` | `.github/devbox-version-sync.json` | |
@@ -109,4 +113,11 @@ shellcheck bin/* tests/fakes/*
 
 The tests run against small projects, with fake `devbox` and `docker` commands in `tests/fakes`.
 
-Callers use the `v1` tag, and the reusable workflows use the action at `@v1`, so to release, move the tag: `git tag -f v1 && git push -f origin v1`. Breaking changes to the config or inputs get a `v2`.
+Callers use the `v1` tag, and the reusable workflows use the action at `@v1`. To release, tag the commit with its own version and publish a GitHub release from that tag, then move `v1` to it:
+
+```sh
+git tag v1.1.0 && git push origin v1.1.0
+git tag -f v1 v1.1.0 && git push -f origin v1
+```
+
+Don't publish a release from `v1` itself, or turn on immutable releases: `v1` has to keep moving. To roll back, point `v1` at the previous version. Breaking changes to the config or inputs get a `v2`.
