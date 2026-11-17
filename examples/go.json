@@ -13,7 +13,7 @@
       ]
     },
     { "name": "PostgreSQL", "package": "postgresql", "auto": "minor" },
-    { "name": "Node.js", "package": "nodejs", "auto": "minor" },
+    { "name": "Node.js", "package": "nodejs", "auto": "minor", "majors": "even" },
     { "package": "goose", "auto": "minor", "group": "tools" },
     { "package": "sqlc", "auto": "minor", "group": "tools" },
     { "package": "squawk", "auto": "minor", "group": "tools" },

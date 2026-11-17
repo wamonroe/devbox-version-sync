@@ -411,6 +411,64 @@ EOF
   [ "$(tail -n 1 <<<"$output")" = "4.1.0" ]
 }
 
+@test "upgrade-available skips prereleases" {
+  ruby_project
+  available ruby 4.1.0-preview1
+  sed -i '/^ruby 4.1.0$/d' "$FAKE_DEVBOX_VERSIONS"
+  run devbox-version-sync upgrade-available ruby
+  [ "$status" -eq 0 ]
+  [ -z "$(grep -v '^devbox' <<<"$output" || true)" ]
+}
+
+@test "upgrade-available steps down from a prerelease to the newest release" {
+  web_project
+  available nodejs 25.9.0 27.0.0-alpha.0.1.0
+  run devbox-version-sync upgrade-available nodejs
+  [ "$status" -eq 0 ]
+  [ "$(tail -n 1 <<<"$output")" = "25.9.0" ]
+}
+
+@test "upgrade-available skips odd majors with majors: even" {
+  web_project
+  jq '.tools[0].majors = "even"' .github/devbox-version-sync.json >c && mv c .github/devbox-version-sync.json
+  available nodejs 25.9.0 26.3.0 27.0.0-alpha.0.1.0
+  run devbox-version-sync upgrade-available nodejs
+  [ "$status" -eq 0 ]
+  [ "$(tail -n 1 <<<"$output")" = "26.3.0" ]
+  # Each spec is resolved once, and 25 and 27 are never tried.
+  [ "$(grep -c 'add nodejs@26$' "$FAKE_DEVBOX_LOG")" -eq 1 ]
+  ! grep -q 'add nodejs@25$\|add nodejs@27$' "$FAKE_DEVBOX_LOG"
+}
+
+@test "upgrade-available reports nothing when only odd majors and prereleases are newer" {
+  web_project
+  jq '.tools[0].majors = "even"' .github/devbox-version-sync.json >c && mv c .github/devbox-version-sync.json
+  available nodejs 25.9.0 27.0.0-alpha.0.1.0
+  run devbox-version-sync upgrade-available nodejs
+  [ "$status" -eq 0 ]
+  [ -z "$(grep -E '^[0-9]' <<<"$output" || true)" ]
+}
+
+@test "update waits when the newest in its policy is a prerelease" {
+  web_project
+  available bun 1.5.0-canary.1
+  export DEVBOX_VERSION_SYNC_STATUS_FILE=$BATS_TEST_TMPDIR/status
+  run devbox-version-sync update bun
+  [ "$status" -eq 0 ]
+  [ "$(tail -n 1 <<<"$output")" = "[]" ]
+  [[ $output == *"Devbox resolves bun@latest to 1.5.0-canary.1, a prerelease. Waiting for a release."* ]]
+  [ "$(cat "$DEVBOX_VERSION_SYNC_STATUS_FILE")" = $'bun\twaiting' ]
+}
+
+@test "check rejects majors: even with auto: major, and unknown values" {
+  go_project
+  jq '.tools[2].majors = "even" | .tools[2].auto = "major" | .tools[3].majors = "odd"' .github/devbox-version-sync.json >c && mv c .github/devbox-version-sync.json
+  run devbox-version-sync check
+  [ "$status" -eq 1 ]
+  [[ $output == *"goose: majors: even only applies to upgrades"* ]]
+  [[ $output == *"sqlc: majors must be all or even, not 'odd'"* ]]
+}
+
 # --- upgrade ------------------------------------------------------------------------
 
 @test "upgrade moves a range to the newest series" {
@@ -430,6 +488,31 @@ EOF
   [ "$status" -eq 0 ]
   grep -qx '    "go": "1.28.0",' devbox.json
   grep -qx 'go 1.28.0' go.mod
+}
+
+@test "upgrade moves to the newest even major, past prereleases" {
+  web_project
+  devbox-version-sync apply nodejs
+  jq '.tools[0].majors = "even"' .github/devbox-version-sync.json >c && mv c .github/devbox-version-sync.json
+  available nodejs 25.9.0 26.3.0 27.0.0-alpha.0.1.0
+  run devbox-version-sync upgrade nodejs
+  [ "$status" -eq 0 ]
+  [ "$(jq -c .packages devbox.json)" = '["bun@latest","nodejs@26"]' ]
+  [ "$(cat .nvmrc)" = "26.3.0" ]
+}
+
+@test "upgrade takes a prerelease only when asked for by name" {
+  web_project
+  devbox-version-sync apply nodejs
+  jq '.tools[0].majors = "even"' .github/devbox-version-sync.json >c && mv c .github/devbox-version-sync.json
+  available nodejs 27.0.0-alpha.0.1.0
+  run devbox-version-sync upgrade nodejs
+  [ "$status" -eq 1 ]
+  [[ $output == *"Devbox offers no release of nodejs newer than 24.21.0 to upgrade to (prereleases and odd majors aside)."* ]]
+  run devbox-version-sync upgrade nodejs 27
+  [ "$status" -eq 0 ]
+  [[ $output == *"nodejs@27 has no release to move to, only 27.0.0-alpha.0.1.0. Upgrading to it because you asked for 27."* ]]
+  [ "$(cat .nvmrc)" = "27.0.0-alpha.0.1.0" ]
 }
 
 @test "upgrade refuses a version that isn't newer" {

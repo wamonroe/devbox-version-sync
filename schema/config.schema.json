@@ -25,6 +25,10 @@
             "enum": ["patch", "minor", "major", "none"],
             "description": "Which releases are automatic updates: patch keeps the first two version parts (4.0.x), minor the first (4.x), major nothing; none makes every release a deliberate upgrade. Required for exact pins; otherwise implied by devbox.json."
           },
+          "majors": {
+            "enum": ["all", "even"],
+            "description": "even upgrades only to even major versions (Node.js LTS releases); odd majors are skipped in issues and the upgrade workflow. Defaults to all."
+          },
           "group": {
             "type": "string",
             "description": "Packages with the same group are updated in one pull request."

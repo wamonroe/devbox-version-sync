@@ -44,6 +44,7 @@ Each package has an update policy. Releases within it, such as Ruby 4.0.x, becom
 | `package` | Package name in `devbox.json`. Required. |
 | `name` | Name for pull requests and issues. Defaults to `package`. |
 | `auto` | Update policy: `patch`, `minor`, `major` or `none`. See below. |
+| `majors` | `even` to upgrade only to even major versions, like Node.js's LTS releases; the default is `all`. Odd majors are skipped in issues and the upgrade workflow. Needs a policy short of `major`, since `major` takes every release automatically. |
 | `group` | Packages with the same group are updated in one pull request, e.g. CLI tools that only `devbox.json` pins. |
 | `checks` | What must exist before moving to a version. Until it does, the sync workflow waits and the upgrade workflow fails. `{version}` is replaced with the version. <br>`docker:IMAGE`: the image is published.<br>`url:URL`: the URL responds.<br>`setup-ruby`: `ruby/setup-ruby@v1` can install that Ruby, so CI using it won't break. |
 | `after_update` | Command to run after pulling the change, listed in pull requests. |
@@ -61,6 +62,10 @@ A policy says how many leading version parts automatic updates keep fixed:
 | `none` | everything | nothing automatic | nothing automatic |
 
 The parts are counted by position, so pick by what the project's releases mean, not their names. Ruby and Go ship significant changes in x.y releases, so they want `patch`. PostgreSQL versions have two parts and 18.7 is its patch release, so it wants `minor`. `check` rejects a policy that would never update.
+
+### Prereleases
+
+Versions with letters in them, such as `27.0.0-alpha.0.1.0`, `4.1.0-preview1` or `2.0.0-rc.1`, are prereleases. They're never automatic updates: if the newest version a policy allows is one, the sync workflow waits for a release. They don't count as upgrades either: when Devbox's newest version is a prerelease (or an odd major, with `majors: even`), the issue names the newest release below it instead, stepping down a series at a time (27 to 26). To move to a prerelease anyway, give the upgrade workflow its version or series by name.
 
 ### How `devbox.json` pins a package
 
