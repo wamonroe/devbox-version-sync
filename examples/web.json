@@ -4,6 +4,7 @@
     {
       "name": "Node.js",
       "package": "nodejs",
+      "majors": "even",
       "files": [
         { "path": ".nvmrc", "match": "^(\\S+)$", "replace": "{version}" }
       ]
