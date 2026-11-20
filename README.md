@@ -81,7 +81,13 @@ The policy has to fit how `devbox.json` pins the package. `devbox.json` can list
 
 Each group always uses the same branch, so a run updates the group's open pull request in place (force-pushing a rebuilt branch) instead of opening another. While a run works on it, a notice at the top of the pull request asks people not to merge or push to it; the run removes the notice when it's done, whatever the outcome. Commits pushed to the branch by hand are lost if a run rebuilds it, so merge soon after pushing one (an sqlc bump's regenerated code, say). If a run finds every package in a group already current, because someone updated them by hand, it closes the group's pull request with a comment saying so. A package waiting on a check keeps its pull request open.
 
-Merging one sync pull request changes `devbox.lock` under the others, which can make them conflict. The example caller also runs on pushes to `main` that change `devbox.json` or `devbox.lock`, so the open pull requests are rebuilt on the new `main` a couple of minutes after each merge.
+Merging one sync pull request changes `devbox.lock` under the others, which can make them conflict. To rebuild one on the new default branch, comment on it:
+
+```
+/devbox-version-sync rebuild
+```
+
+The example caller runs the sync workflow on `issue_comment` for this. It rebuilds only that pull request's group, reacts 👀 to the comment when it starts and 🚀 (or 😕) when it's done, and replies if the command can't run (an unknown command, or a pull request it didn't open). Only the repository's owner, members and collaborators can use it. Every comment in the repository starts the caller, but its job is skipped unless the comment is the command, and a skipped job uses no Actions minutes. Otherwise the weekly run rebuilds every open pull request. Rebuilding on each push to `main` instead keeps them current without asking, at the cost of a CI run on every open sync pull request after each merge.
 
 | Input | Default | |
 | --- | --- | --- |
@@ -89,6 +95,7 @@ Merging one sync pull request changes `devbox.lock` under the others, which can 
 | `assignees` | | Comma-separated users to assign pull requests and issues to. |
 | `upgrade-workflow` | `devbox_version_upgrade.yml` | The caller's upgrade workflow file name, linked from issues. |
 | `issue-label` | `devbox-version-upgrade` | |
+| `group` | | Update only this group. Empty for every group; the rebuild command picks its pull request's. |
 
 **Upgrade** (`.github/workflows/upgrade.yml`, run by hand) moves one package beyond its policy. Its `version` input takes a version or series ("4.1"); leave it blank for the newest. The pull request it opens includes a checklist and closes the package's issue. It takes the same `config`, `assignees` and `issue-label` inputs.
 

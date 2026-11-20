@@ -254,6 +254,21 @@ EOF
   [ "$output" = '[{"name":"go","packages":["go"]},{"name":"postgresql","packages":["postgresql"]},{"name":"tools","packages":["goose","sqlc"]},{"name":"xcodegen","packages":["xcodegen"]}]' ]
 }
 
+@test "list GROUP gives only that group" {
+  go_project
+  run devbox-version-sync list tools
+  [ "$status" -eq 0 ]
+  [ "$output" = '[{"name":"tools","packages":["goose","sqlc"]}]' ]
+}
+
+@test "list GROUP fails for a group the config doesn't have" {
+  go_project
+  run devbox-version-sync list nope
+  [ "$status" -eq 1 ]
+  [[ $output == *'no update group "nope"'* ]]
+  [[ $output == *"(groups: go, postgresql, tools, xcodegen)"* ]]
+}
+
 @test "info describes a package" {
   ruby_project
   run devbox-version-sync info ruby

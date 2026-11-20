@@ -18,6 +18,12 @@ name: Devbox Version Sync
 # package in a group already current (updated by hand, say), it closes that
 # group's pull request.
 #
+# Commented `/devbox-version-sync rebuild` on a sync pull request (the
+# caller runs this workflow on `issue_comment`), it rebuilds only that pull
+# request's group on the default branch, reacting 👀 to the comment when it
+# starts and 🚀 or 😕 when it's done. Only the repository's owner, members and
+# collaborators can use it.
+#
 # The caller grants contents, issues and pull-requests write. Pull requests
 # opened with the default GITHUB_TOKEN don't trigger CI, so pass a `token`
 # secret (a fine-grained PAT with Contents and Pull requests write access) for
@@ -42,6 +48,10 @@ on:
         description: Label for issues about releases beyond a package's policy.
         type: string
         default: devbox-version-upgrade
+      group:
+        description: Update only this group (the part of its branch after devbox-version-sync/). Empty for every group; a rebuild command picks its pull request's.
+        type: string
+        default: ""
     secrets:
       token:
         description: Token for opening pull requests, so they trigger CI. Defaults to GITHUB_TOKEN.
@@ -54,6 +64,10 @@ jobs:
   list:
     name: List packages
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
     outputs:
       groups: ${{ steps.list.outputs.groups }}
     steps:
@@ -63,16 +77,79 @@ jobs:
       - name: Set up devbox-version-sync
         uses: wamonroe/devbox-version-sync@v1
 
+      # A comment on an issue or pull request: act only on the rebuild
+      # command, from someone with write access, on a sync pull request.
+      # Anything else ends the run without updating, replying when it was
+      # meant as a command.
+      - name: Read the rebuild command
+        id: command
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BODY: ${{ github.event.comment.body }}
+          ASSOCIATION: ${{ github.event.comment.author_association }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          NUMBER: ${{ github.event.issue.number }}
+          IS_PR: ${{ github.event.issue.pull_request != null }}
+          DEVBOX_VERSION_SYNC_CONFIG: ${{ inputs.config }}
+        run: |
+          react() { gh api -X POST "repos/$GH_REPO/issues/comments/$COMMENT_ID/reactions" -f content="$1" > /dev/null; }
+          refuse() {
+            react confused
+            gh api "repos/$GH_REPO/issues/$NUMBER/comments" -f body="$1" > /dev/null
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$1"
+            exit 0
+          }
+
+          read -r command action rest <<< "$(head -n 1 <<< "$BODY" | tr -d '\r')"
+          if [[ $command != /devbox-version-sync || $IS_PR != true ]]; then
+            echo "Not a rebuild command on a pull request."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case $ASSOCIATION in
+            OWNER | MEMBER | COLLABORATOR) ;;
+            *)
+              echo "Ignoring a command from $ASSOCIATION (needs OWNER, MEMBER or COLLABORATOR)."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          if [[ $action != rebuild || -n $rest ]]; then
+            refuse "Devbox Version Sync understands \`/devbox-version-sync rebuild\`, which rebuilds this pull request on the default branch."
+          fi
+
+          pr=$(gh pr view "$NUMBER" --json headRefName,isCrossRepository,state)
+          branch=$(jq -r .headRefName <<< "$pr")
+          if [[ $(jq -r .isCrossRepository <<< "$pr") == true || $branch != devbox-version-sync/* ]]; then
+            refuse "\`/devbox-version-sync rebuild\` only works on pull requests Devbox Version Sync opened (branches named \`devbox-version-sync/<group>\`)."
+          fi
+          if [[ $(jq -r .state <<< "$pr") != OPEN ]]; then
+            refuse "This pull request isn't open, so there's nothing to rebuild."
+          fi
+          group=${branch#devbox-version-sync/}
+          if ! devbox-version-sync list "$group" > /dev/null; then
+            refuse "The config has no update group \`$group\` anymore, so this pull request can't be rebuilt. Close it, and the weekly run opens any update that's still needed."
+          fi
+
+          react eyes
+          echo "Rebuilding #$NUMBER ($group)."
+          echo "group=$group" >> "$GITHUB_OUTPUT"
+
       - name: List update groups
         id: list
+        if: steps.command.outputs.skip != 'true'
         env:
           DEVBOX_VERSION_SYNC_CONFIG: ${{ inputs.config }}
-        run: echo "groups=$(devbox-version-sync list)" >> "$GITHUB_OUTPUT"
+          GROUP: ${{ steps.command.outputs.group || inputs.group }}
+        run: echo "groups=$(devbox-version-sync list "$GROUP")" >> "$GITHUB_OUTPUT"
 
   update:
     name: Update ${{ matrix.group.name }}
     needs: list
-    if: needs.list.outputs.groups != '[]'
+    if: needs.list.outputs.groups != '[]' && needs.list.outputs.groups != ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -281,3 +358,11 @@ jobs:
           body=$(perl -0pe 's/\Q$ENV{NOTICE_START}\E.*?\Q$ENV{NOTICE_END}\E\n*//gs' <<< "$body")
           gh pr edit "$NUMBER" --body "$body"
           echo "Removed the update notice from #$NUMBER."
+
+      - name: Report back on the rebuild command
+        if: always() && github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REACTION: ${{ job.status == 'success' && 'rocket' || 'confused' }}
+        run: gh api -X POST "repos/$GH_REPO/issues/comments/$COMMENT_ID/reactions" -f content="$REACTION" > /dev/null
