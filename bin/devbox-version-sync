@@ -13,7 +13,8 @@
 #                                               disagrees with devbox.lock.
 #   devbox-version-sync apply [PACKAGE...]      Write the devbox.lock version into the
 #                                               files (all packages by default).
-#   devbox-version-sync list                    Update groups, as JSON.
+#   devbox-version-sync list [GROUP]            Update groups, as JSON. With GROUP,
+#                                               only that one (or fail if there's none).
 #   devbox-version-sync info PACKAGE            Mode, policy, version and files, as JSON.
 #   devbox-version-sync update PACKAGE...       Move each package to the newest version
 #                                               its policy allows and update its files.
@@ -643,11 +644,18 @@ cmd_apply() {
 }
 
 cmd_list() {
-  jq -c '
+  local only=${1:-} groups
+  groups=$(jq -c '
     reduce (.tools[] | {name: (.group // .package), package}) as $t ([];
       (map(.name) | index($t.name)) as $i
       | if $i == null then . + [{name: $t.name, packages: [$t.package]}]
-        else .[$i].packages += [$t.package] end)' "$config"
+        else .[$i].packages += [$t.package] end)' "$config")
+  if [[ -z $only ]]; then
+    echo "$groups"
+    return
+  fi
+  jq -ce --arg g "$only" 'map(select(.name == $g)) | if length == 1 then . else empty end' <<<"$groups" ||
+    die "no update group \"$only\" in $config (groups: $(jq -r 'map(.name) | join(", ")' <<<"$groups"))"
 }
 
 # What automatic updates follow, for messages: "4.0.x", "every release" or nothing.
@@ -858,7 +866,7 @@ shift || true
 case $command in
   check) require_config && cmd_check ;;
   apply) require_config && cmd_apply "$@" ;;
-  list) require_config && cmd_list ;;
+  list) require_config && cmd_list "${1:-}" ;;
   info) require_config && cmd_info "${1:?package}" ;;
   update) require_config && cmd_update "$@" ;;
   upgrade-available) require_config && upgrade_available "${1:?package}" ;;

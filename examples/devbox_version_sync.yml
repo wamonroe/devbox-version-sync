@@ -5,22 +5,32 @@ on:
   schedule:
     - cron: "17 14 * * 1" # Mondays, 14:17 UTC
   workflow_dispatch:
-  # Merging one sync pull request changes devbox.lock under the others; a run
-  # straight after rebuilds them on the new main, so they don't conflict.
-  push:
-    branches: [main]
-    paths: [devbox.json, devbox.lock]
+  # Merging one sync pull request changes devbox.lock under the others.
+  # Comment `/devbox-version-sync rebuild` on one that conflicts to rebuild it
+  # on the default branch.
+  issue_comment:
+    types: [created]
 
 # Shared with the upgrade workflow, so the two never push at once. Don't cancel
-# a run in progress: it may be halfway through opening a pull request.
+# a run in progress: it may be halfway through opening a pull request. Other
+# comments get a group of their own, so they never take a waiting run's place.
 concurrency:
-  group: devbox-version-sync
+  group: ${{ (github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/devbox-version-sync')) && 'devbox-version-sync' || format('devbox-version-sync-comment-{0}', github.run_id) }}
   cancel-in-progress: false
 
 permissions: {}
 
 jobs:
   sync:
+    # Every comment starts this workflow; only the command, on a pull request,
+    # from someone with write access, runs the job (a skipped job uses no
+    # minutes).
+    if: >-
+      github.event_name != 'issue_comment' || (
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/devbox-version-sync') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
     uses: wamonroe/devbox-version-sync/.github/workflows/sync.yml@v1
     permissions:
       contents: write
